@@ -1,0 +1,164 @@
+"""Optional shell sandbox runner."""
+
+import os
+import signal
+import subprocess
+import threading
+from pathlib import Path
+from shutil import which as default_which
+
+from .checker import SandboxChecker
+from .command_matcher import command_is_excluded
+from .config import SandboxConfig
+
+
+class SandboxRunner:
+    def __init__(self, config=None, *, which=None, run=None, emit_event=None):
+        self.config = config or SandboxConfig()
+        self.which = which or default_which
+        self.run_process = run
+        self.emit_event = emit_event or (lambda event, payload: None)
+        self._process_lock = threading.Lock()
+        self._active_process = None
+
+    @property
+    def has_active_process(self):
+        with self._process_lock:
+            process = self._active_process
+        return process is not None and process.poll() is None
+
+    def abort(self):
+        with self._process_lock:
+            process = self._active_process
+        if process is None or process.poll() is not None:
+            return False
+        self._terminate_process(process)
+        return True
+
+    def run(self, command, *, cwd, env, timeout):
+        config = self.config
+        if config.mode == "off" or (
+            config.mode != "required"
+            and command_is_excluded(command, config.excluded_commands)
+        ):
+            return self._plain(command, cwd=cwd, env=env, timeout=timeout)
+
+        backend_path = SandboxChecker(self.which).backend_path(config.backend)
+        if not backend_path:
+            self.emit_event(
+                "sandbox_unavailable",
+                {
+                    "mode": config.mode,
+                    "backend": config.backend,
+                    "command": str(command or "")[:200],
+                },
+            )
+            if config.mode == "required":
+                raise RuntimeError("sandbox required but unavailable")
+            return self._plain(command, cwd=cwd, env=env, timeout=timeout)
+
+        argv = self._bubblewrap_argv(backend_path, command, Path(cwd), config)
+        return self._execute(
+            argv,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            shell=False,
+        )
+
+    def _plain(self, command, *, cwd, env, timeout):
+        return self._execute(command, cwd=cwd, env=env, timeout=timeout, shell=True)
+
+    def _execute(self, command, *, cwd, env, timeout, shell):
+        if self.run_process is not None:
+            return self.run_process(
+                command,
+                cwd=cwd,
+                shell=shell,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+
+        process_kwargs = {
+            "cwd": cwd,
+            "shell": shell,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "env": env,
+        }
+        if os.name == "nt":
+            process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            process_kwargs["start_new_session"] = True
+        process = subprocess.Popen(command, **process_kwargs)
+        with self._process_lock:
+            self._active_process = process
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._terminate_process(process)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                command, timeout, output=stdout, stderr=stderr
+            )
+        finally:
+            with self._process_lock:
+                if self._active_process is process:
+                    self._active_process = None
+        return subprocess.CompletedProcess(
+            command, process.returncode, stdout=stdout, stderr=stderr
+        )
+
+    @staticmethod
+    def _terminate_process(process):
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                return
+            except (OSError, subprocess.SubprocessError):
+                process.terminate()
+                return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            process.terminate()
+
+    def _bubblewrap_argv(self, backend_path, command, cwd, config):
+        argv = [
+            backend_path,
+            "--die-with-parent",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind",
+            "/bin",
+            "/bin",
+            "--ro-bind",
+            "/lib",
+            "/lib",
+            "--ro-bind",
+            "/lib64",
+            "/lib64",
+        ]
+        bind_mode = "--bind" if config.workspace_write else "--ro-bind"
+        argv.extend([bind_mode, str(cwd), str(cwd)])
+        for path in config.extra_readonly_paths:
+            argv.extend(["--ro-bind", path, path])
+        for path in (*config.deny_read, *config.deny_write):
+            argv.extend(["--tmpfs", path])
+        argv.extend(["--chdir", str(cwd), "--", "/bin/sh", "-lc", str(command)])
+        return argv
