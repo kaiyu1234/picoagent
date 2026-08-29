@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: pico
+Version: 0.3.0
+Summary: Small local coding agent for OpenAI-compatible, Anthropic-compatible, and DeepSeek models
+Requires-Python: >=3.10
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: textual>=0.86.0
+Requires-Dist: tomli>=2.0.0; python_version < "3.11"
